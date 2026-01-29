@@ -335,7 +335,7 @@ def _build_h2_force_operator(
     mo_coeff: np.ndarray,
     ncas: int = 2,
     cholesky_tol: float = 1e-8,
-    delta: float = 1e-2,  # h (Angstrom)
+    delta: float = 1e-3,  # h (Angstrom)
 ) -> SparsePauliOp:
     """
     ハミルトニアン積分の有限差分を用いて、力演算子を構築する。
