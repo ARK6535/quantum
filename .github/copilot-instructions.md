@@ -26,6 +26,7 @@ planned for the future; keep helper APIs basis-agnostic where possible.
 
 ```
 h2_helpers.py            # Shared constants, quantum-chemistry utilities, log parsers
+h2_dynamics.py           # Molecular dynamics helpers: Velocity Verlet, force wrappers, parallel workers
 h2_energy.py             # Noisy-backend VQE energy (+ force) computation
 h2_energy_statevector.py # Noiseless statevector VQE energy (+ force) computation
 h2_energy_demo.py        # Main entry-point: MD simulation, force-curve comparison
