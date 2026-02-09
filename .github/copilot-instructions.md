@@ -25,14 +25,14 @@ planned for the future; keep helper APIs basis-agnostic where possible.
 > **Target layout after refactoring** — new code must follow this structure.
 
 ```
-h2_helpers.py            # Shared constants, quantum-chemistry utilities, log parsers
-h2_dynamics.py           # Molecular dynamics helpers: Velocity Verlet, force wrappers, parallel workers
+h2_helpers.py            # Shared constants, quantum-chemistry utilities, log parsers, save_run_config()
+h2_dynamics.py           # Molecular dynamics helpers: Velocity Verlet, force wrappers, checkpoint/resume
 h2_energy.py             # Noisy-backend VQE energy (+ force) computation
 h2_energy_statevector.py # Noiseless statevector VQE energy (+ force) computation
-h2_energy_demo.py        # Main entry-point: MD simulation, force-curve comparison
-h2_energy_distribution.py# Statistical sampling of VQE energies
-vqe_h2.py               # Single-shot noisy VQE for H2 (educational / experimental)
-vqe_LiH.py              # Single-shot noisy VQE for LiH (educational / experimental)
+h2_energy_demo.py        # Main entry-point: MD simulation (CLI: --resume, --n-steps, --basis, etc.)
+h2_energy_distribution.py# Statistical sampling of VQE energies (CLI: --samples, --workers, --basis, etc.)
+vqe_h2.py               # Single-shot noisy VQE for H2 (CLI: --distance, --shots, --basis, etc.)
+vqe_LiH.py              # Single-shot noisy VQE for LiH (CLI: --distance, --shots, --cas-norb, etc.)
 plot_energy_vs_distance.py # Visualization: energy vs distance from logs
 plot_force_from_log.py     # Visualization: force vs distance from logs
 read_csv.py                # Visualization: MD trajectory analysis from CSV
@@ -52,7 +52,17 @@ read_csv.py                # Visualization: MD trajectory analysis from CSV
    function and guard it with `if __name__ == "__main__": main()`.
    CLI argument parsing must be extracted into a dedicated `parse_args()`
    function that returns an `argparse.Namespace`.
-4. **Separation of concerns** — Visualization scripts (`plot_*.py`, `read_csv.py`)
+   Simulation parameters that were previously hardcoded (distance, basis set,
+   ansatz reps, maxiter, shots, etc.) are now exposed as CLI arguments.
+   Parameters that are rarely changed (e.g. `cholesky_tol`,
+   `h_bohr_finite_diff`) remain as function keyword-argument defaults but
+   are recorded in `run_config.json` via the `extra` dict.
+4. **run_config.json** — Every entry-point must call
+   `save_run_config(log_dir, args, backend_type=..., extra=...)` at startup.
+   This writes `run_config.json` containing the CLI command, Python/package
+   versions, platform info, all CLI args, and extra parameters for
+   reproducibility.
+5. **Separation of concerns** — Visualization scripts (`plot_*.py`, `read_csv.py`)
    must not contain VQE or MD computation logic.  Computation modules must not
    contain plotting code (except optional inline debug plots behind a flag).
 
@@ -180,6 +190,24 @@ a **custom format** (step,energy lines with `#` comment lines for optimizer
 switches).  Keep this as **manual `open`/`write`** — do not route through
 `logging.FileHandler`.
 
+### Checkpoint & resume (MD simulation)
+
+`dynamics_seq()` in `h2_dynamics.py` supports incremental checkpointing:
+
+- **Incremental CSV** — `dynamics_seq.csv` is opened in append mode and
+  flushed after every Velocity-Verlet step, so data survives a crash.
+- **Atomic checkpoint** — `checkpoint.json` is written via a temporary file +
+  `os.replace()` to avoid corruption on kill.  It records `next_step`,
+  `total_step`, `r_bohr`, `v_bohr_per_au`, `energy_hartree`,
+  `force_hartree_per_bohr`, `time_step_fs`, and `timestamp`.
+- **`--resume LOG_DIR`** — `h2_energy_demo.py` accepts this flag.  On resume
+  it reads `checkpoint.json`, restores state, copies the existing CSV, and
+  appends subsequent steps.  `run_config.json` is re-saved with
+  `"resumed_from"` in the `extra` dict.
+
+When modifying `dynamics_seq()`, preserve the per-step flush and atomic
+checkpoint semantics.
+
 ---
 
 ## Error Handling
@@ -248,17 +276,21 @@ to avoid redundant evaluations.  The cache key is produced by `_key()` in
 
 ```
 logs/<YYMMDDHHmm>/
+    run_config.json              # Execution parameters & environment (all entry-points)
+    checkpoint.json              # MD checkpoint for resume (h2_energy_demo.py)
+    dynamics_seq.csv             # MD trajectory data, flushed per step
     h2_energy_quantum_0.74.txt   # VQE trace for R = 0.74 Å
     h2_energy_quantum_0.76.txt
     ...
     _energy_vs_distance_<ts>.txt # Summary table
-    _h2_dynamics_data.txt        # MD trajectory (CSV)
+    force_vs_distance_vqe.txt    # Force summary table
 ```
 
 - Timestamp format: `YYMMDDHHmm` (e.g. `2602091345`).
 - VQE log filename: **`h2_energy_quantum_{distance:.2f}.txt`** (canonical).
   The legacy `{distance}_h2_energy_quantum.txt` format is accepted by
   `parse_log_files` but should not be produced by new code.
+- The legacy `_h2_dynamics_data.txt` is replaced by `dynamics_seq.csv`.
 
 ### Git-ignored files
 
