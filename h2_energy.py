@@ -1,43 +1,56 @@
-"""Utilities for evaluating the H2 ground-state energy.
+"""Noisy-backend VQE energy computation for H2.
 
-This module exposes two convenience functions:
-
-* ``compute_h2_energy_quantum`` evaluates the energy with a small VQE loop
-  executed on ``AerSimulator``.
-* ``compute_h2_energy_classical`` evaluates the same geometry with a
-  reference Hartree–Fock calculation (PySCF).
-
-Both helpers expect the interatomic distance in Angstrom and return the energy
-in Hartree.
+Evaluates the H2 ground-state energy using a VQE loop executed on an
+``AerSimulator`` noise model derived from a real IBM backend.
 """
 from __future__ import annotations
 
-from typing import Any, List, Optional, Sequence, Tuple
-
-import numpy as np
-from pyscf import mcscf, scf
-from qiskit import QuantumCircuit
-from qiskit.circuit.library import efficient_su2
-from qiskit_ibm_runtime import QiskitRuntimeService
-from qiskit.primitives import BackendEstimatorV2
-from qiskit_aer import AerSimulator
-from scipy.optimize import minimize
+import logging
 import os
 import time
+from collections.abc import Sequence
+from typing import Any
+
+import numpy as np
+from qiskit import QuantumCircuit
+from qiskit.primitives import BackendEstimatorV2
+from qiskit_aer import AerSimulator
+from qiskit_ibm_runtime import QiskitRuntimeService
 from qiskit_nature.second_q.circuit.library import UCCSD
 from qiskit_nature.second_q.mappers import JordanWignerMapper
+from scipy.optimize import minimize
 
-from h2_helpers import _build_h2_qubit_hamiltonian, _build_pass_manager, _key, compute_h2_energy_classical
+from h2_helpers import (
+    _build_h2_qubit_hamiltonian,
+    _build_pass_manager,
+    _key,
+    compute_h2_energy_classical,
+)
 
 __all__ = [
+    "build_hf_reference_circuit",
     "compute_h2_energy_quantum",
+    "compute_h2_energy_qubit_exact",
+    "debug_compare_hamiltonian_vs_fci",
 ]
 
+logger = logging.getLogger(__name__)
+
 def build_hf_reference_circuit(num_qubits: int, occ: Sequence[int]) -> QuantumCircuit:
+    """Build a Hartree-Fock reference circuit by flipping occupied qubits.
+
+    Args:
+        num_qubits: Total number of qubits in the circuit.
+        occ: Indices of qubits to set to |1> (occupied modes).
+
+    Returns:
+        A QuantumCircuit with X gates applied to the occupied qubits.
+    """
     qc = QuantumCircuit(num_qubits)
     for q in occ:
         qc.x(q)  # 対応するモードを占有状態に
     return qc
+
 
 def compute_h2_energy_qubit_exact(
     distance_angstrom: float,
@@ -45,8 +58,15 @@ def compute_h2_energy_qubit_exact(
     basis: str = "sto-3g",
     cholesky_tol: float = 1e-10,
 ) -> float:
-    """_build_h2_qubit_hamiltonian が返す qubit Hamiltonian を
-    そのまま行列にして厳密対角化し、基底エネルギーを返す。
+    """Return the exact ground-state energy by diagonalising the qubit Hamiltonian.
+
+    Args:
+        distance_angstrom: H-H distance in Ångströms.
+        basis: Gaussian basis set name.
+        cholesky_tol: Tolerance for Cholesky decomposition of 2e integrals.
+
+    Returns:
+        Lowest eigenvalue of the qubit Hamiltonian matrix in Hartree.
     """
     hamiltonian = _build_h2_qubit_hamiltonian(
         distance_angstrom=distance_angstrom,
@@ -54,9 +74,9 @@ def compute_h2_energy_qubit_exact(
         cholesky_tol=cholesky_tol,
     )
 
-    Hmat = hamiltonian.to_matrix()       # 4qubit → 16x16 の行列
-    evals = np.linalg.eigvalsh(Hmat)     # Hermitian なので eigvalsh でOK
-    return float(evals[0])               # 最小固有値が基底エネルギー
+    h_mat = hamiltonian.to_matrix()
+    evals = np.linalg.eigvalsh(h_mat)
+    return float(evals[0])
 
 
 def debug_compare_hamiltonian_vs_fci(
@@ -65,25 +85,22 @@ def debug_compare_hamiltonian_vs_fci(
     basis: str = "sto-3g",
     cholesky_tol: float = 1e-10,
 ) -> None:
-    """与えられた R, basis について、
-    PySCF CASCI(F CI相当) エネルギーと
-    qubit Hamiltonian の厳密対角化エネルギーを比較して表示する。
-    """
-    E_fci = compute_h2_energy_classical(
-        distance_angstrom,
-        basis=basis,
-    )
-    E_qubit = compute_h2_energy_qubit_exact(
-        distance_angstrom,
-        basis=basis,
-        cholesky_tol=cholesky_tol,
-    )
+    """Print a comparison of Full-CI and qubit-Hamiltonian exact energies.
 
-    diff = E_qubit - E_fci
+    Args:
+        distance_angstrom: H-H distance in Ångströms.
+        basis: Gaussian basis set name.
+        cholesky_tol: Tolerance for Cholesky decomposition of 2e integrals.
+    """
+    e_fci = compute_h2_energy_classical(distance_angstrom, basis=basis)
+    e_qubit = compute_h2_energy_qubit_exact(
+        distance_angstrom, basis=basis, cholesky_tol=cholesky_tol,
+    )
+    diff = e_qubit - e_fci
 
     print(f"R = {distance_angstrom:.3f} Å, basis = {basis}")
-    print(f"  FCI (PySCF CASCI) energy     : {E_fci:.12f} Ha")
-    print(f"  Qubit Hamiltonian exact energy: {E_qubit:.12f} Ha")
+    print(f"  FCI (PySCF CASCI) energy     : {e_fci:.12f} Ha")
+    print(f"  Qubit Hamiltonian exact energy: {e_qubit:.12f} Ha")
     print(f"  Difference (qubit - FCI)      : {diff:+.3e} Ha")
 
 
@@ -93,20 +110,38 @@ def compute_h2_energy_quantum(
     basis: str = "sto-3g",
     ansatz_reps: int = 1,
     optimizer_maxiter: int = 200,
-    random_seed: Optional[int] = 7,
+    random_seed: int | None = 7,
     return_trace: bool = False,
     cholesky_tol: float = 1e-6,
-    backend_name: Optional[str] = None,
-    runtime_service: Optional[QiskitRuntimeService] = None,
-    backend: Optional[Any] = None,
+    backend_name: str | None = None,
+    runtime_service: QiskitRuntimeService | None = None,
+    backend: Any | None = None,
     timestamp: str,
     occ: Sequence[int] = (1, 3),
-) -> float | Tuple[float, Sequence[float]]:
-    """Estimate the H2 ground-state energy with the VQE stack used in ``vqe_LiH``.
+) -> float | tuple[float, Sequence[float]]:
+    """Estimate the H2 ground-state energy via VQE on a noisy simulator.
 
-    The circuit is transpiled to the selected backend's ISA, but the execution
-    always happens on ``AerSimulator.from_backend`` so that only a noisy
-    simulator is used (no real hardware shots).
+    The circuit is transpiled to the selected backend's ISA, then executed
+    on ``AerSimulator.from_backend`` (noisy simulator, no real hardware).
+    Uses a two-stage optimisation: COBYLA followed by L-BFGS-B.
+
+    Args:
+        distance_angstrom: H-H distance in Ångströms.
+        basis: Gaussian basis set name.
+        ansatz_reps: Number of repetition layers for the UCCSD ansatz.
+        optimizer_maxiter: Maximum iterations per optimiser stage.
+        random_seed: Random seed (unused, kept for interface compatibility).
+        return_trace: If True, return the energy trace alongside the result.
+        cholesky_tol: Tolerance for Cholesky decomposition of 2e integrals.
+        backend_name: IBM backend name to derive the noise model from.
+        runtime_service: Pre-initialised QiskitRuntimeService instance.
+        backend: Pre-initialised backend object (takes precedence).
+        timestamp: Timestamp string for the log directory (YYMMDDHHmm).
+        occ: Qubit indices for the HF reference occupation.
+
+    Returns:
+        The minimum VQE energy in Hartree.  If *return_trace* is True,
+        returns a tuple ``(energy, trace)``.
     """
     hamiltonian = _build_h2_qubit_hamiltonian(
         distance_angstrom=distance_angstrom,
@@ -123,7 +158,7 @@ def compute_h2_energy_quantum(
     mapper = JordanWignerMapper()
     ansatz = UCCSD(
         num_spatial_orbitals=2,
-        num_particles=(1,1),
+        num_particles=(1, 1),
         reps=ansatz_reps,
         qubit_mapper=mapper,
     )
@@ -155,27 +190,30 @@ def compute_h2_energy_quantum(
     backend_sim = AerSimulator.from_backend(backend)
     estimator = BackendEstimatorV2(backend=backend_sim)
 
-    eval_chache: dict[bytes, float] = {}
+    eval_cache: dict[bytes, float] = {}
 
     def cost_function(params: np.ndarray) -> float:
         k = _key(params)
-        if k in eval_chache:
-            return eval_chache[k]
+        if k in eval_cache:
+            return eval_cache[k]
         pub = (ansatz_isa, [hamiltonian_isa], [params])
         result = estimator.run(pubs=[pub]).result()  # type: ignore[arg-type]
         value = float(result[0].data.evs[0])  # type: ignore[attr-defined]
-        eval_chache[k] = value
+        eval_cache[k] = value
         return value
 
-    trace: List[float] = []
+    trace: list[float] = []
 
     def _callback(xk: np.ndarray) -> None:
         trace.append(cost_function(xk))
-        print(f"dist: {distance_angstrom:.6f} Current energy: {trace[-1]:.6f} Ha")
-    
+        logger.debug(
+            "dist=%.4f Å  step=%d  energy=%.6f Ha",
+            distance_angstrom, len(trace), trace[-1],
+        )
+
     start_time = time.time()
 
-    print(f"Starting optimization for distance: {distance_angstrom:.2f} Å")
+    logger.info("Starting COBYLA for distance=%.2f Å", distance_angstrom)
 
     res = minimize(
         cost_function,
@@ -188,7 +226,10 @@ def compute_h2_energy_quantum(
 
     cobyla_point = res.x
     shifted_step = len(trace)
-    print(f"Switching to L-BFGS-B optimizer at step {shifted_step}, energy: {trace[-1]:.6f} Ha,distance: {distance_angstrom:.6f} Å")
+    logger.info(
+        "Switching to L-BFGS-B at step %d, energy=%.6f Ha, distance=%.4f Å",
+        shifted_step, trace[-1], distance_angstrom,
+    )
 
     res = minimize(
         cost_function,
@@ -208,7 +249,10 @@ def compute_h2_energy_quantum(
     end_time = time.time()
     total_time = end_time - start_time
 
-    print(f"VQE optimization for {distance_angstrom:.2f} Å Finished in {total_time:.2f} seconds")
+    logger.info(
+        "VQE finished for %.2f Å in %.2f s, energy=%.6f Ha",
+        distance_angstrom, total_time, result_energy,
+    )
 
     os.makedirs(f"logs/{timestamp}", exist_ok=True)
     with open(f"logs/{timestamp}/{distance_angstrom:.2f}_h2_energy_quantum.txt", "w") as f:

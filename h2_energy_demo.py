@@ -6,9 +6,9 @@ from concurrent.futures import ProcessPoolExecutor
 import csv
 import math
 
-from h2_energy import compute_h2_energy_classical, compute_h2_energy_quantum, debug_compare_hamiltonian_vs_fci
+from h2_energy import compute_h2_energy_quantum, debug_compare_hamiltonian_vs_fci
 from h2_energy_statevector import compute_h2_energy_quantum_statevector
-from h2_helpers import A0, MU, T_AU_FS
+from h2_helpers import A0, MU, T_AU_FS, compute_h2_energy_classical
 import numpy as np
 
 from typing import Dict, List, Tuple, Union, Callable, Any
