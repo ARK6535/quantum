@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 
+from h2_energy_noisy import compute_h2_energy_quantum_noisy
 from h2_energy_statevector import compute_h2_energy_quantum_statevector
 from h2_helpers import (
     A0,
@@ -89,30 +90,49 @@ def energy_quantum_bohr(
     ansatz_reps: int = 1,
     optimizer_maxiter: int = 2000,
     cholesky_tol: float = 1e-10,
+    backend_type: str = "statevector",
+    shots: int = 4096,
+    force_shots: int = 16384,
 ) -> float:
-    """Return the statevector-VQE energy at *r_bohr* (Bohr) in Hartree.
+    """Return the VQE energy at *r_bohr* (Bohr) in Hartree.
 
     Args:
         r_bohr: Internuclear distance in Bohr.
         timestamp: Log-directory timestamp string (YYMMDDHHmm).
-        backend: Optional pre-initialised backend (unused for statevector).
+        backend: Optional pre-initialised backend.
         basis: Gaussian basis set name.
         ansatz_reps: Number of ansatz repetition layers.
         optimizer_maxiter: Maximum iterations per optimiser stage.
         cholesky_tol: Tolerance for Cholesky decomposition.
+        backend_type: ``"statevector"`` or ``"noisy"``.
+        shots: Number of shots for noisy energy evaluation.
+        force_shots: Number of shots for noisy force evaluation.
 
     Returns:
         Minimum VQE energy in Hartree.
     """
     r_angstrom = r_bohr * BOHR_TO_ANGSTROM
-    val = compute_h2_energy_quantum_statevector(
-        r_angstrom,
-        basis=basis,
-        timestamp=timestamp,
-        ansatz_reps=ansatz_reps,
-        optimizer_maxiter=optimizer_maxiter,
-        cholesky_tol=cholesky_tol,
-    )
+    if backend_type == "noisy":
+        val = compute_h2_energy_quantum_noisy(
+            r_angstrom,
+            timestamp=timestamp,
+            basis=basis,
+            ansatz_reps=ansatz_reps,
+            optimizer_maxiter=optimizer_maxiter,
+            cholesky_tol=cholesky_tol,
+            backend=backend,
+            shots=shots,
+            force_shots=force_shots,
+        )
+    else:
+        val = compute_h2_energy_quantum_statevector(
+            r_angstrom,
+            timestamp=timestamp,
+            basis=basis,
+            ansatz_reps=ansatz_reps,
+            optimizer_maxiter=optimizer_maxiter,
+            cholesky_tol=cholesky_tol,
+        )
     if isinstance(val, tuple):
         return val[0]
     return val
@@ -128,6 +148,9 @@ def force_quantum_bohr(
     ansatz_reps: int = 1,
     optimizer_maxiter: int = 2000,
     cholesky_tol: float = 1e-10,
+    backend_type: str = "statevector",
+    shots: int = 4096,
+    force_shots: int = 16384,
 ) -> float:
     """Return the VQE force at *r_bohr* via central finite difference.
 
@@ -140,6 +163,9 @@ def force_quantum_bohr(
         ansatz_reps: Number of ansatz repetition layers.
         optimizer_maxiter: Maximum iterations per optimiser stage.
         cholesky_tol: Tolerance for Cholesky decomposition.
+        backend_type: ``"statevector"`` or ``"noisy"``.
+        shots: Number of shots for noisy energy evaluation.
+        force_shots: Number of shots for noisy force evaluation.
 
     Returns:
         Force in Hartree/Bohr (negative gradient).
@@ -148,11 +174,13 @@ def force_quantum_bohr(
         r_bohr + h_bohr, backend=backend, timestamp=timestamp,
         basis=basis, ansatz_reps=ansatz_reps,
         optimizer_maxiter=optimizer_maxiter, cholesky_tol=cholesky_tol,
+        backend_type=backend_type, shots=shots, force_shots=force_shots,
     )
     e_minus = energy_quantum_bohr(
         r_bohr - h_bohr, backend=backend, timestamp=timestamp,
         basis=basis, ansatz_reps=ansatz_reps,
         optimizer_maxiter=optimizer_maxiter, cholesky_tol=cholesky_tol,
+        backend_type=backend_type, shots=shots, force_shots=force_shots,
     )
     return -(e_plus - e_minus) / (2.0 * h_bohr)
 
@@ -166,6 +194,9 @@ def force_quantum_angstrom(
     ansatz_reps: int = 1,
     optimizer_maxiter: int = 2000,
     cholesky_tol: float = 1e-10,
+    backend_type: str = "statevector",
+    shots: int = 4096,
+    force_shots: int = 16384,
 ) -> float:
     """Return the VQE force at *r_angstrom* (Å) in Ha/Å.
 
@@ -177,6 +208,9 @@ def force_quantum_angstrom(
         ansatz_reps: Number of ansatz repetition layers.
         optimizer_maxiter: Maximum iterations per optimiser stage.
         cholesky_tol: Tolerance for Cholesky decomposition.
+        backend_type: ``"statevector"`` or ``"noisy"``.
+        shots: Number of shots for noisy energy evaluation.
+        force_shots: Number of shots for noisy force evaluation.
 
     Returns:
         Force in Hartree/Ångström.
@@ -186,6 +220,7 @@ def force_quantum_angstrom(
         r_bohr, backend=backend, timestamp=timestamp,
         basis=basis, ansatz_reps=ansatz_reps,
         optimizer_maxiter=optimizer_maxiter, cholesky_tol=cholesky_tol,
+        backend_type=backend_type, shots=shots, force_shots=force_shots,
     )
     return f_bohr * ANGSTROM_TO_BOHR
 
@@ -285,6 +320,9 @@ def dynamics_seq(
     ansatz_reps: int = 1,
     optimizer_maxiter: int = 2000,
     resume_from: str | None = None,
+    backend_type: str = "statevector",
+    shots: int = 4096,
+    force_shots: int = 16384,
 ) -> None:
     """Run a sequential MD simulation using VQE forces at each step.
 
@@ -295,7 +333,7 @@ def dynamics_seq(
 
     Args:
         timestamp: Log-directory timestamp string (YYMMDDHHmm).
-        backend: Optional pre-initialised backend (unused for statevector).
+        backend: Optional pre-initialised backend.
         initial_r_angstrom: Initial H-H distance in Ångströms.
         initial_v_ang_per_fs: Initial relative velocity in Å/fs.
         time_step_fs: Integration time step in femtoseconds.
@@ -306,6 +344,9 @@ def dynamics_seq(
         resume_from: Path to a log directory containing ``checkpoint.json``.
             When given, simulation state is restored and appended to the
             existing CSV.
+        backend_type: ``"statevector"`` or ``"noisy"``.
+        shots: Number of shots for noisy energy evaluation.
+        force_shots: Number of shots for noisy force evaluation.
     """
     out_dir = f"logs/{timestamp}"
     os.makedirs(out_dir, exist_ok=True)
@@ -317,16 +358,29 @@ def dynamics_seq(
     def _eval_energy_force(rb: float) -> tuple[float, float]:
         """Return (energy_hartree, force_hartree_per_bohr) at R=rb (Bohr)."""
         r_ang = rb * BOHR_TO_ANGSTROM
-        energy_hartree, force_hartree_per_angstrom = compute_h2_energy_quantum_statevector(
-            r_ang,
-            basis=basis,
-            timestamp=timestamp,
-            ansatz_reps=ansatz_reps,
-            optimizer_maxiter=optimizer_maxiter,
-            cholesky_tol=1e-10,
-        )
+        if backend_type == "noisy":
+            energy_hartree, force_hartree_per_angstrom = compute_h2_energy_quantum_noisy(
+                r_ang,
+                timestamp=timestamp,
+                basis=basis,
+                ansatz_reps=ansatz_reps,
+                optimizer_maxiter=optimizer_maxiter,
+                cholesky_tol=1e-10,
+                backend=backend,
+                shots=shots,
+                force_shots=force_shots,
+            )
+        else:
+            energy_hartree, force_hartree_per_angstrom = compute_h2_energy_quantum_statevector(
+                r_ang,
+                timestamp=timestamp,
+                basis=basis,
+                ansatz_reps=ansatz_reps,
+                optimizer_maxiter=optimizer_maxiter,
+                cholesky_tol=1e-10,
+            )
         if not isinstance(force_hartree_per_angstrom, float):
-            raise ValueError("compute_h2_energy_quantum_statevector did not return force value.")
+            raise ValueError("VQE did not return a force value.")
         force_hartree_per_bohr = force_hartree_per_angstrom * BOHR_TO_ANGSTROM
         return float(energy_hartree), float(force_hartree_per_bohr)
 

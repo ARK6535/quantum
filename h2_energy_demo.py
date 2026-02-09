@@ -116,6 +116,24 @@ def parse_args() -> argparse.Namespace:
         help="IBM Quantum backend to mimic with AerSimulator (defaults to least busy real backend).",
     )
     parser.add_argument(
+        "--backend-type",
+        choices=["statevector", "noisy"],
+        default="statevector",
+        help="VQE backend type: 'statevector' (noiseless) or 'noisy' (default: statevector).",
+    )
+    parser.add_argument(
+        "--shots",
+        type=int,
+        default=4096,
+        help="Number of shots for noisy energy evaluation (default: 4096).",
+    )
+    parser.add_argument(
+        "--force-shots",
+        type=int,
+        default=16384,
+        help="Number of shots for noisy force evaluation (default: 16384).",
+    )
+    parser.add_argument(
         "--resume",
         default=None,
         metavar="LOG_DIR",
@@ -242,7 +260,7 @@ def main() -> None:
     )
     # プロジェクト内ロガーだけ INFO にする
     log_level = logging.DEBUG if args.verbose else logging.INFO
-    for name in ("h2_energy_demo", "h2_dynamics", "h2_energy", "h2_energy_statevector", "h2_helpers"):
+    for name in ("h2_energy_demo", "h2_dynamics", "h2_energy", "h2_energy_statevector", "h2_energy_noisy", "h2_helpers"):
         logging.getLogger(name).setLevel(log_level)
 
     # --resume 時は前回のタイムスタンプを引き継ぐ
@@ -264,11 +282,13 @@ def main() -> None:
     save_run_config(
         log_dir,
         args,
-        backend_type="statevector",
+        backend_type=args.backend_type,
         extra={
             "cholesky_tol": 1e-10,
             "h_bohr_finite_diff": 0.01,
             "resumed_from": args.resume,
+            "shots": args.shots,
+            "force_shots": args.force_shots,
         },
     )
 
@@ -288,6 +308,9 @@ def main() -> None:
         ansatz_reps=args.ansatz_reps,
         optimizer_maxiter=args.maxiter,
         resume_from=args.resume,
+        backend_type=args.backend_type,
+        shots=args.shots,
+        force_shots=args.force_shots,
     )
 
 
