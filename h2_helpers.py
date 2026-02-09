@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-from typing import Any, List, Optional, Sequence, Tuple
+import glob
+import logging
+import os
+import re
+from itertools import combinations
+from typing import Any
 
 import numpy as np
-from pyscf import ao2mo, gto, mcscf, scf, grad
+from pyscf import ao2mo, gto, mcscf, scf
+from qiskit import QuantumCircuit
 from qiskit.circuit.library import XGate
-from qiskit.quantum_info import SparsePauliOp
 from qiskit.primitives import BackendEstimatorV2
-from qiskit_aer import AerSimulator
+from qiskit.quantum_info import SparsePauliOp
 from qiskit.transpiler import PassManager
 from qiskit.transpiler.passes import (
     ALAPScheduleAnalysis,
@@ -15,11 +20,7 @@ from qiskit.transpiler.passes import (
     PadDynamicalDecoupling,
 )
 from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
-from itertools import combinations
-from qiskit import QuantumCircuit
-import glob
-import re
-import os
+from qiskit_aer import AerSimulator
 
 # Shared scientific constants (kept here to avoid duplication across scripts)
 HARTREE_TO_JOULE = 4.3597447222071e-18
@@ -33,6 +34,24 @@ MU = M_H / 2.0
 T_AU_FS = 0.02418884254  # 1 atomic unit of time in femtoseconds
 A0 = BOHR_TO_ANGSTROM
 
+__all__ = [
+    "A0",
+    "ANGSTROM_TO_BOHR",
+    "ANGSTROM_TO_METER",
+    "AMU_TO_KG",
+    "BOHR_TO_ANGSTROM",
+    "FS_TO_SECOND",
+    "HARTREE_TO_JOULE",
+    "M_H",
+    "MU",
+    "T_AU_FS",
+    "compute_h2_energy_classical",
+    "parse_log_files",
+]
+
+logger = logging.getLogger(__name__)
+
+
 def _build_sparse_pauli_hamiltonian(
     ecore: float,
     h1e: np.ndarray,
@@ -42,7 +61,7 @@ def _build_sparse_pauli_hamiltonian(
     ncas, _ = h1e.shape
 
     creators, destructors = _creators_destructors(2 * ncas)
-    excitations: List[List[SparsePauliOp]] = []
+    excitations: list[list[SparsePauliOp]] = []
     for p in range(ncas):
         terms = [creators[p] @ destructors[p] + creators[ncas + p] @ destructors[ncas + p]]
         for r in range(p + 1, ncas):
@@ -76,8 +95,8 @@ def _identity(num_qubits: int) -> SparsePauliOp:
     return SparsePauliOp.from_list([("I" * num_qubits, 1.0)])
 
 
-def _creators_destructors(num_modes: int) -> Tuple[List[SparsePauliOp], List[SparsePauliOp]]:
-    creators: List[SparsePauliOp] = []
+def _creators_destructors(num_modes: int) -> tuple[list[SparsePauliOp], list[SparsePauliOp]]:
+    creators: list[SparsePauliOp] = []
     for index in range(num_modes):
         if index == 0:
             left, right = "I" * (num_modes - 1), ""
@@ -96,7 +115,7 @@ def _creators_destructors(num_modes: int) -> Tuple[List[SparsePauliOp], List[Spa
     return creators, destructors
 
 
-def _cholesky(tensor: np.ndarray, eps: float) -> Tuple[np.ndarray, int]:
+def _cholesky(tensor: np.ndarray, eps: float) -> tuple[np.ndarray, int]:
     num_orbitals = tensor.shape[0]
     ch_max = 20 * num_orbitals
     reshaped = tensor.reshape(num_orbitals**2, num_orbitals**2)
@@ -149,7 +168,7 @@ def _build_h2_qubit_hamiltonian(
     distance_angstrom: float,
     basis: str,
     cholesky_tol: float,
-) -> Tuple[SparsePauliOp, gto.Mole, Any, np.ndarray]:
+) -> tuple[SparsePauliOp, gto.Mole, Any, np.ndarray]:
     mol = _build_h2_molecule(distance_angstrom, basis)
     mf = scf.RHF(mol)
     mf.conv_tol = 1e-12
@@ -186,15 +205,21 @@ def _find_lowest_det_occupation(
     hamiltonian: SparsePauliOp,
     num_electrons: int,
     backend: AerSimulator,
-) -> Tuple[Tuple[int, ...], float]:
-    """与えられた qubit Hamiltonian に対し、
-    「ポップカウント=num_electrons の計算基底状態」の中で
-    最もエネルギーが低い配置（HF 的な1行列式）を返す。
+) -> tuple[tuple[int, ...], float]:
+    """Find the lowest-energy single-determinant among all computational-basis states.
 
-    戻り値:
-        (occupied_indices, energy)
-        occupied_indices: 占有している qubit index のタプル（例: (0, 1)）
-        energy: その1行列式のエネルギー [Hartree]
+    Iterates over every determinant with exactly *num_electrons* occupied
+    qubits and returns the one with the lowest energy expectation value.
+
+    Args:
+        hamiltonian: Qubit Hamiltonian as a SparsePauliOp.
+        num_electrons: Number of occupied qubits (popcount constraint).
+        backend: AerSimulator backend used for expectation-value evaluation.
+
+    Returns:
+        A tuple ``(occupied_indices, energy)`` where *occupied_indices* is a
+        tuple of qubit indices that are occupied, and *energy* is the
+        corresponding energy in Hartree.
     """
     num_qubits = hamiltonian.num_qubits
     if num_qubits is None:
@@ -202,7 +227,7 @@ def _find_lowest_det_occupation(
 
     estimator = BackendEstimatorV2(backend=backend)
 
-    best_occ: Optional[Tuple[int, ...]] = None
+    best_occ: tuple[int, ...] | None = None
     best_energy: float = float("inf")
 
     # 例: num_qubits=4, num_electrons=2 → combinations(range(4), 2) = 6通り
@@ -227,12 +252,21 @@ def _find_lowest_det_occupation(
 
     return best_occ, best_energy
 
-def parse_log_files(log_dir):
-    """VQEログから
-       - 距離
-       - 最小エネルギー（VQE）
-       - 最初のエネルギー（HF 初期値）
-    を読み取って返す。
+def parse_log_files(log_dir: str) -> list[tuple[float, float, float, float | None]]:
+    """Parse VQE log files and extract per-distance results.
+
+    Reads all ``h2_energy_quantum_*.txt`` files (and the legacy
+    ``*_h2_energy_quantum.txt`` format) in *log_dir* and extracts the
+    bond distance, minimum VQE energy, initial (HF) energy, and
+    Hellmann-Feynman force for each file.
+
+    Args:
+        log_dir: Path to the log directory to scan.
+
+    Returns:
+        A list of ``(distance, min_energy, hf_energy, force)`` tuples
+        sorted by distance.  *force* is ``None`` when not present in
+        the log file.
     """
     data = []
     pattern = os.path.join(log_dir, "*_h2_energy_quantum.txt")
@@ -240,7 +274,7 @@ def parse_log_files(log_dir):
 
     files = glob.glob(pattern) + glob.glob(pattern2)
 
-    print(f"Found {len(files)} files in {log_dir}")
+    logger.info("Found %d files in %s", len(files), log_dir)
 
     for file_path in files:
         filename = os.path.basename(file_path)
@@ -250,7 +284,7 @@ def parse_log_files(log_dir):
         match2 = re.search(r"([\d\.]+)_h2_energy_quantum\.txt", filename)
         match = match or match2
         if not match:
-            print(f"Skipping file with unexpected name format: {filename}")
+            logger.warning("Skipping file with unexpected name format: %s", filename)
             continue
 
         distance = float(match.group(1))
@@ -273,7 +307,7 @@ def parse_log_files(log_dir):
                         try:
                             hf_energy = float(parts[1])
                         except ValueError:
-                            print(f"Could not parse HF energy from line: {line} in {filename}")
+                            logger.warning("Could not parse HF energy from line: %s in %s", line, filename)
 
                 # 最適化後の最小エネルギー
                 if "Minimum energy:" in line:
@@ -282,7 +316,7 @@ def parse_log_files(log_dir):
                     try:
                         min_energy = float(parts[2])
                     except (ValueError, IndexError):
-                        print(f"Could not parse minimum energy from line: {line} in {filename}")
+                        logger.warning("Could not parse minimum energy from line: %s in %s", line, filename)
 
                 if "computed force at optimized geometry:" in line:
                     # 例: "computed force at optimized geometry: 0.0123456789 Ha/Angstrom"
@@ -290,13 +324,13 @@ def parse_log_files(log_dir):
                     try:
                         force = float(parts[5])
                     except (ValueError, IndexError):
-                        print(f"Could not parse force from line: {line} in {filename}")
+                        logger.warning("Could not parse force from line: %s in %s", line, filename)
 
         if min_energy is None:
-            print(f"No minimum energy found in {filename}")
+            logger.warning("No minimum energy found in %s", filename)
             continue
         if hf_energy is None:
-            print(f"No HF (first) energy found in {filename}")
+            logger.warning("No HF (first) energy found in %s", filename)
             continue
 
         data.append((distance, min_energy, hf_energy, force))
@@ -315,7 +349,16 @@ def compute_h2_energy_classical(
     basis: str = "sto-3g",
     conv_tol: float = 1e-12,
 ) -> float:
-    """Return the Full CI energy of the H2 molecule at a given distance."""
+    """Return the Full-CI energy of H2 at the given bond length.
+
+    Args:
+        distance_angstrom: H-H distance in Ångströms.
+        basis: Gaussian basis set name.
+        conv_tol: SCF convergence tolerance.
+
+    Returns:
+        Total electronic energy in Hartree.
+    """
     mol = _build_h2_molecule(distance_angstrom, basis)
     mf = scf.RHF(mol)
     mf.conv_tol = conv_tol
@@ -337,9 +380,19 @@ def _build_h2_force_operator(
     cholesky_tol: float = 1e-8,
     delta: float = 1e-3,  # h (Angstrom)
 ) -> SparsePauliOp:
-    """
-    ハミルトニアン積分の有限差分を用いて、力演算子を構築する。
-    4次中央差分により dH/dR を高精度化する。
+    """Build the force operator -dH/dR via finite differences of AO integrals.
+
+    Uses a 4th-order central difference scheme for higher accuracy.
+
+    Args:
+        mol: PySCF molecule object at the reference geometry.
+        mo_coeff: MO coefficient matrix from the CASCI calculation.
+        ncas: Number of active-space orbitals.
+        cholesky_tol: Tolerance for Cholesky decomposition of the 2e integrals.
+        delta: Finite-difference step size in Ångströms.
+
+    Returns:
+        The force operator as a SparsePauliOp (in units of Ha/Å).
     """
     coords0 = mol.atom_coords(unit="Angstrom")
 
