@@ -12,6 +12,7 @@ import numpy as np
 from qiskit_ibm_runtime import QiskitRuntimeService
 
 from h2_energy_statevector import compute_h2_energy_quantum_statevector
+from h2_helpers import save_run_config
 
 __all__ = [
     "main",
@@ -28,6 +29,8 @@ def run_batch(
     backend_name: str,
     timestamp: str,
     batch_id: int,
+    basis: str = "sto-3g",
+    ansatz_reps: int = 1,
 ) -> list[float]:
     """Run a batch of VQE energy calculations in a single worker.
 
@@ -37,6 +40,8 @@ def run_batch(
         backend_name: IBM backend name for QiskitRuntimeService.
         timestamp: Log-directory timestamp string (YYMMDDHHmm).
         batch_id: Integer identifier for this batch.
+        basis: Gaussian basis set name.
+        ansatz_reps: Number of ansatz repetition layers.
 
     Returns:
         List of computed energies in Hartree.
@@ -54,8 +59,8 @@ def run_batch(
         result = compute_h2_energy_quantum_statevector(
             distance_angstrom=distance_angstrom,
             timestamp=timestamp,
-            basis="sto-3g",
-            ansatz_reps=1,
+            basis=basis,
+            ansatz_reps=ansatz_reps,
         )
         # 戻り値は (energy, force) タプル
         energy = result[0] if isinstance(result, tuple) else result
@@ -96,6 +101,22 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="IBM Quantum backend name.",
     )
+    parser.add_argument(
+        "--basis",
+        default="sto-3g",
+        help="Gaussian basis set name (default: sto-3g).",
+    )
+    parser.add_argument(
+        "--ansatz-reps",
+        type=int,
+        default=1,
+        help="Number of ansatz repetition layers (default: 1).",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable debug logging.",
+    )
     return parser.parse_args()
 
 
@@ -106,10 +127,18 @@ def main() -> None:
         level=logging.WARNING,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    log_level = logging.DEBUG if args.verbose else logging.INFO
     for name in ("h2_energy_distribution", "h2_energy_statevector", "h2_helpers"):
-        logging.getLogger(name).setLevel(logging.INFO)
+        logging.getLogger(name).setLevel(log_level)
 
     timestamp = time.strftime("%y%m%d%H%M")
+    log_dir = f"logs/{timestamp}"
+
+    save_run_config(
+        log_dir,
+        args,
+        backend_type="statevector",
+    )
 
     # バックエンド解決（メインプロセスで一度だけ）
     service = QiskitRuntimeService()
@@ -141,7 +170,10 @@ def main() -> None:
 
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
         futures = [
-            executor.submit(run_batch, size, args.distance, backend_name, timestamp, i)
+            executor.submit(
+                run_batch, size, args.distance, backend_name, timestamp, i,
+                args.basis, args.ansatz_reps,
+            )
             for i, size in enumerate(batches)
         ]
         for fut in futures:

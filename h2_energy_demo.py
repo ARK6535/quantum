@@ -17,7 +17,7 @@ from h2_dynamics import (
     energy_worker,
     force_classical_angstrom,
 )
-from h2_helpers import ANGSTROM_TO_BOHR, compute_h2_energy_classical
+from h2_helpers import ANGSTROM_TO_BOHR, compute_h2_energy_classical, save_run_config
 
 __all__ = [
     "main",
@@ -70,21 +70,61 @@ def plot_dynamics_results(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="H2 energy helper demo")
     parser.add_argument(
+        "--initial-distance",
+        type=float,
+        default=0.8,
+        help="Initial H-H distance in Ångströms (default: 0.8).",
+    )
+    parser.add_argument(
+        "--initial-velocity",
+        type=float,
+        default=0.0,
+        help="Initial relative velocity in Å/fs (default: 0.0).",
+    )
+    parser.add_argument(
+        "--dt",
+        type=float,
+        default=0.01,
+        help="Integration time step in femtoseconds (default: 0.01).",
+    )
+    parser.add_argument(
+        "--n-steps",
+        type=int,
+        default=1000,
+        help="Number of Velocity-Verlet steps (default: 1000).",
+    )
+    parser.add_argument(
+        "--basis",
+        default="sto-3g",
+        help="Gaussian basis set name (default: sto-3g).",
+    )
+    parser.add_argument(
         "--ansatz-reps",
         type=int,
-        default=0,
-        help="Number of EfficientSU2 repetitions.",
+        default=1,
+        help="Number of ansatz repetition layers (default: 1).",
     )
     parser.add_argument(
         "--maxiter",
         type=int,
-        default=80,
-        help="Maximum COBYLA iterations.",
+        default=2000,
+        help="Maximum optimiser iterations per stage (default: 2000).",
     )
     parser.add_argument(
         "--backend-name",
         default=None,
         help="IBM Quantum backend to mimic with AerSimulator (defaults to least busy real backend).",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        metavar="LOG_DIR",
+        help="Resume from a previous run's log directory (e.g. logs/2602091619).",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable debug logging.",
     )
     return parser.parse_args()
 
@@ -201,16 +241,54 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     # プロジェクト内ロガーだけ INFO にする
+    log_level = logging.DEBUG if args.verbose else logging.INFO
     for name in ("h2_energy_demo", "h2_dynamics", "h2_energy", "h2_energy_statevector", "h2_helpers"):
-        logging.getLogger(name).setLevel(logging.INFO)
-    timestamp = time.strftime("%y%m%d%H%M")
+        logging.getLogger(name).setLevel(log_level)
 
-    r_angstrom = 0.735
-    r_bohr = r_angstrom * ANGSTROM_TO_BOHR
-    e = energy_classical_bohr(r_bohr)
-    logger.info("Classical Full CI energy at R=%.3f Å: %.12f Ha", r_angstrom, e)
+    # --resume 時は前回のタイムスタンプを引き継ぐ
+    if args.resume:
+        import json as _json
 
-    dynamics_seq(timestamp)
+        ckpt_file = os.path.join(args.resume, "checkpoint.json")
+        if not os.path.isfile(ckpt_file):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_file}")
+        with open(ckpt_file) as f:
+            ckpt = _json.load(f)
+        timestamp = ckpt["timestamp"]
+        log_dir = f"logs/{timestamp}"
+        logger.info("Resuming run from %s (timestamp=%s)", args.resume, timestamp)
+    else:
+        timestamp = time.strftime("%y%m%d%H%M")
+        log_dir = f"logs/{timestamp}"
+
+    save_run_config(
+        log_dir,
+        args,
+        backend_type="statevector",
+        extra={
+            "cholesky_tol": 1e-10,
+            "h_bohr_finite_diff": 0.01,
+            "resumed_from": args.resume,
+        },
+    )
+
+    if not args.resume:
+        r_angstrom = args.initial_distance
+        r_bohr = r_angstrom * ANGSTROM_TO_BOHR
+        e = energy_classical_bohr(r_bohr, basis=args.basis)
+        logger.info("Classical Full CI energy at R=%.3f Å: %.12f Ha", r_angstrom, e)
+
+    dynamics_seq(
+        timestamp,
+        initial_r_angstrom=args.initial_distance,
+        initial_v_ang_per_fs=args.initial_velocity,
+        time_step_fs=args.dt,
+        total_step=args.n_steps,
+        basis=args.basis,
+        ansatz_reps=args.ansatz_reps,
+        optimizer_maxiter=args.maxiter,
+        resume_from=args.resume,
+    )
 
 
 if __name__ == "__main__":

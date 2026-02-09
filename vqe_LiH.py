@@ -29,6 +29,8 @@ from qiskit_aer import AerSimulator
 from qiskit_ibm_runtime import QiskitRuntimeService
 from scipy.optimize import minimize
 
+from h2_helpers import save_run_config
+
 __all__ = [
     "cholesky",
     "identity",
@@ -202,6 +204,36 @@ def parse_args() -> argparse.Namespace:
         help="Li-H distance in angstroms (default: 1.56)",
     )
     parser.add_argument(
+        "--basis",
+        default="sto-6g",
+        help="Gaussian basis set name (default: sto-6g)",
+    )
+    parser.add_argument(
+        "--ansatz-reps",
+        type=int,
+        default=2,
+        help="Number of EfficientSU2 repetition layers (default: 2)",
+    )
+    parser.add_argument(
+        "--shots",
+        type=int,
+        default=10000,
+        help="Number of measurement shots (default: 10000)",
+    )
+    parser.add_argument(
+        "--cas-norb",
+        type=int,
+        default=5,
+        help="Number of active-space orbitals for CASCI (default: 5)",
+    )
+    parser.add_argument(
+        "--cas-nelec",
+        type=int,
+        nargs=2,
+        default=[1, 1],
+        help="Number of active electrons (alpha, beta) for CASCI (default: 1 1)",
+    )
+    parser.add_argument(
         "--maxiter",
         type=int,
         default=300,
@@ -227,6 +259,9 @@ def main() -> None:
             logging.DEBUG if args.verbose else logging.INFO,
         )
 
+    timestamp = time.strftime("%y%m%d%H%M")
+    log_dir = f"logs/{timestamp}"
+
     # IBM Runtime接続
     service = QiskitRuntimeService()
     if args.backend:
@@ -235,12 +270,14 @@ def main() -> None:
         backend = service.least_busy(operational=True, simulator=False)
     logger.info("Using backend: %s", backend.name)
 
+    backend_type = f"noisy:{backend.name}"
+
     # LiH分子構築
     mol = gto.Mole()
     mol.build(
         verbose=0,
         atom=[["Li", (0, 0, 0)], ["H", (0, 0, args.distance)]],
-        basis="sto-6g",
+        basis=args.basis,
         spin=0,
         charge=0,
         symmetry="Coov",
@@ -258,7 +295,8 @@ def main() -> None:
 
     # CASCI計算
     active_space = range(mol.nelectron // 2 - 1, mol.nelectron // 2 + 1)
-    mx = mcscf.CASCI(mf, ncas=5, nelecas=(1, 1))
+    cas_nelec = tuple(args.cas_nelec)
+    mx = mcscf.CASCI(mf, ncas=args.cas_norb, nelecas=cas_nelec)
     cas_space_symmetry = {"A1": 3, "E1x": 1, "E1y": 1}
     mo = mcscf.sort_mo_by_irrep(mx, mf.mo_coeff, cas_space_symmetry)
     casci_result = mx.kernel(mo)[:2]
@@ -271,9 +309,23 @@ def main() -> None:
     H = build_hamiltonian(ecore, h1e, h2e)
     logger.info("Hamiltonian: %d qubits, %d terms", H.num_qubits, len(H))
 
+    save_run_config(
+        log_dir,
+        args,
+        backend_type=backend_type,
+        extra={
+            "cholesky_tol": 1e-6,
+            "nuclear_repulsion": float(nuclear_repulsion),
+            "rhf_energy": float(true_energy),
+            "casci_energy": casci_result,
+            "hamiltonian_num_qubits": H.num_qubits,
+            "hamiltonian_num_terms": len(H),
+        },
+    )
+
     # アンザッツ構築
     ansatz = efficient_su2(
-        H.num_qubits, su2_gates=["ry"], entanglement="linear", reps=2,
+        H.num_qubits, su2_gates=["ry"], entanglement="linear", reps=args.ansatz_reps,
     )
     x0: list[float] = [0, 0, 1, 1, 1, 0, 0, 1, 1, 1]
     x0.extend([0.0] * (ansatz.num_parameters - 10))
@@ -341,7 +393,8 @@ def main() -> None:
     logger.info("Optimization finished in %.2f s", elapsed_total)
 
     # VQEトレース保存
-    np.savetxt(f"vqe_energies_{time.strftime('%y%m%d%H%M')}.txt", energies)
+    os.makedirs(log_dir, exist_ok=True)
+    np.savetxt(os.path.join(log_dir, f"vqe_energies_{timestamp}.txt"), energies)
 
     # 結果表示
     print(f"Final energy - nuclear repulsion: {result.fun - nuclear_repulsion:.6f} Ha")

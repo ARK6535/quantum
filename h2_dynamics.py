@@ -6,9 +6,11 @@ parallel-execution utilities used by the main demo script.
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import math
 import os
+import shutil
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -64,23 +66,29 @@ def _v_au_to_angfs(v_au: float | np.ndarray) -> float | np.ndarray:
 # Energy / force wrappers (Bohr / Ångström interfaces)
 # ---------------------------------------------------------------------------
 
-def energy_classical_bohr(r_bohr: float) -> float:
+def energy_classical_bohr(r_bohr: float, *, basis: str = "sto-3g") -> float:
     """Return the classical Full-CI energy at *r_bohr* (Bohr) in Hartree.
 
     Args:
         r_bohr: Internuclear distance in Bohr.
+        basis: Gaussian basis set name.
 
     Returns:
         Total electronic energy in Hartree.
     """
     r_angstrom = r_bohr * BOHR_TO_ANGSTROM
-    return compute_h2_energy_classical(r_angstrom, basis="sto-3g")
+    return compute_h2_energy_classical(r_angstrom, basis=basis)
 
 
 def energy_quantum_bohr(
     r_bohr: float,
     timestamp: str,
     backend: Any | None = None,
+    *,
+    basis: str = "sto-3g",
+    ansatz_reps: int = 1,
+    optimizer_maxiter: int = 2000,
+    cholesky_tol: float = 1e-10,
 ) -> float:
     """Return the statevector-VQE energy at *r_bohr* (Bohr) in Hartree.
 
@@ -88,6 +96,10 @@ def energy_quantum_bohr(
         r_bohr: Internuclear distance in Bohr.
         timestamp: Log-directory timestamp string (YYMMDDHHmm).
         backend: Optional pre-initialised backend (unused for statevector).
+        basis: Gaussian basis set name.
+        ansatz_reps: Number of ansatz repetition layers.
+        optimizer_maxiter: Maximum iterations per optimiser stage.
+        cholesky_tol: Tolerance for Cholesky decomposition.
 
     Returns:
         Minimum VQE energy in Hartree.
@@ -95,11 +107,11 @@ def energy_quantum_bohr(
     r_angstrom = r_bohr * BOHR_TO_ANGSTROM
     val = compute_h2_energy_quantum_statevector(
         r_angstrom,
-        basis="sto-3g",
+        basis=basis,
         timestamp=timestamp,
-        ansatz_reps=1,
-        optimizer_maxiter=2000,
-        cholesky_tol=1e-10,
+        ansatz_reps=ansatz_reps,
+        optimizer_maxiter=optimizer_maxiter,
+        cholesky_tol=cholesky_tol,
     )
     if isinstance(val, tuple):
         return val[0]
@@ -111,6 +123,11 @@ def force_quantum_bohr(
     timestamp: str,
     h_bohr: float = 0.01,
     backend: Any | None = None,
+    *,
+    basis: str = "sto-3g",
+    ansatz_reps: int = 1,
+    optimizer_maxiter: int = 2000,
+    cholesky_tol: float = 1e-10,
 ) -> float:
     """Return the VQE force at *r_bohr* via central finite difference.
 
@@ -119,12 +136,24 @@ def force_quantum_bohr(
         timestamp: Log-directory timestamp string.
         h_bohr: Finite-difference step in Bohr.
         backend: Optional pre-initialised backend.
+        basis: Gaussian basis set name.
+        ansatz_reps: Number of ansatz repetition layers.
+        optimizer_maxiter: Maximum iterations per optimiser stage.
+        cholesky_tol: Tolerance for Cholesky decomposition.
 
     Returns:
         Force in Hartree/Bohr (negative gradient).
     """
-    e_plus = energy_quantum_bohr(r_bohr + h_bohr, backend=backend, timestamp=timestamp)
-    e_minus = energy_quantum_bohr(r_bohr - h_bohr, backend=backend, timestamp=timestamp)
+    e_plus = energy_quantum_bohr(
+        r_bohr + h_bohr, backend=backend, timestamp=timestamp,
+        basis=basis, ansatz_reps=ansatz_reps,
+        optimizer_maxiter=optimizer_maxiter, cholesky_tol=cholesky_tol,
+    )
+    e_minus = energy_quantum_bohr(
+        r_bohr - h_bohr, backend=backend, timestamp=timestamp,
+        basis=basis, ansatz_reps=ansatz_reps,
+        optimizer_maxiter=optimizer_maxiter, cholesky_tol=cholesky_tol,
+    )
     return -(e_plus - e_minus) / (2.0 * h_bohr)
 
 
@@ -132,6 +161,11 @@ def force_quantum_angstrom(
     r_angstrom: float,
     timestamp: str,
     backend: Any | None = None,
+    *,
+    basis: str = "sto-3g",
+    ansatz_reps: int = 1,
+    optimizer_maxiter: int = 2000,
+    cholesky_tol: float = 1e-10,
 ) -> float:
     """Return the VQE force at *r_angstrom* (Å) in Ha/Å.
 
@@ -139,12 +173,20 @@ def force_quantum_angstrom(
         r_angstrom: Internuclear distance in Ångströms.
         timestamp: Log-directory timestamp string.
         backend: Optional pre-initialised backend.
+        basis: Gaussian basis set name.
+        ansatz_reps: Number of ansatz repetition layers.
+        optimizer_maxiter: Maximum iterations per optimiser stage.
+        cholesky_tol: Tolerance for Cholesky decomposition.
 
     Returns:
         Force in Hartree/Ångström.
     """
     r_bohr = r_angstrom * ANGSTROM_TO_BOHR
-    f_bohr = force_quantum_bohr(r_bohr, backend=backend, timestamp=timestamp)
+    f_bohr = force_quantum_bohr(
+        r_bohr, backend=backend, timestamp=timestamp,
+        basis=basis, ansatz_reps=ansatz_reps,
+        optimizer_maxiter=optimizer_maxiter, cholesky_tol=cholesky_tol,
+    )
     return f_bohr * ANGSTROM_TO_BOHR
 
 
@@ -231,56 +273,108 @@ def simulate_h2_1d(
 # Sequential VQE-force MD
 # ---------------------------------------------------------------------------
 
-def dynamics_seq(timestamp: str, backend: Any | None = None) -> None:
+def dynamics_seq(
+    timestamp: str,
+    backend: Any | None = None,
+    *,
+    initial_r_angstrom: float = 0.8,
+    initial_v_ang_per_fs: float = 0.0,
+    time_step_fs: float = 0.01,
+    total_step: int = 1000,
+    basis: str = "sto-3g",
+    ansatz_reps: int = 1,
+    optimizer_maxiter: int = 2000,
+    resume_from: str | None = None,
+) -> None:
     """Run a sequential MD simulation using VQE forces at each step.
 
-    Writes per-step results to ``logs/<timestamp>/dynamics_seq.csv``.
+    CSV rows are written incrementally after each step so that partial
+    results survive process termination.  A ``checkpoint.json`` file is
+    updated every step; pass its directory as *resume_from* to continue
+    a previous run.
 
     Args:
         timestamp: Log-directory timestamp string (YYMMDDHHmm).
         backend: Optional pre-initialised backend (unused for statevector).
+        initial_r_angstrom: Initial H-H distance in Ångströms.
+        initial_v_ang_per_fs: Initial relative velocity in Å/fs.
+        time_step_fs: Integration time step in femtoseconds.
+        total_step: Number of Velocity-Verlet steps.
+        basis: Gaussian basis set name.
+        ansatz_reps: Number of ansatz repetition layers.
+        optimizer_maxiter: Maximum iterations per optimiser stage.
+        resume_from: Path to a log directory containing ``checkpoint.json``.
+            When given, simulation state is restored and appended to the
+            existing CSV.
     """
-    # シミュレーションパラメータ
-    initial_r_angstrom = 0.8
-    initial_v_ang_per_fs = 0.0
-    time_step_fs = 0.01
-    total_step = 1000
-
-    dt_au = time_step_fs / T_AU_FS
-    r_bohr = initial_r_angstrom * ANGSTROM_TO_BOHR
-    v_bohr_per_au = initial_v_ang_per_fs * ANGSTROM_TO_BOHR / (1.0 / T_AU_FS)
-
     out_dir = f"logs/{timestamp}"
     os.makedirs(out_dir, exist_ok=True)
     out_csv = os.path.join(out_dir, "dynamics_seq.csv")
+    ckpt_path = os.path.join(out_dir, "checkpoint.json")
 
-    results: list[dict[str, float]] = []
+    fieldnames = ["step", "t_fs", "R_ang", "v_ang_per_fs", "E_ha", "F_ha_per_ang"]
 
     def _eval_energy_force(rb: float) -> tuple[float, float]:
         """Return (energy_hartree, force_hartree_per_bohr) at R=rb (Bohr)."""
         r_ang = rb * BOHR_TO_ANGSTROM
         energy_hartree, force_hartree_per_angstrom = compute_h2_energy_quantum_statevector(
             r_ang,
-            basis="sto-3g",
+            basis=basis,
             timestamp=timestamp,
-            ansatz_reps=1,
-            optimizer_maxiter=2000,
+            ansatz_reps=ansatz_reps,
+            optimizer_maxiter=optimizer_maxiter,
             cholesky_tol=1e-10,
         )
         if not isinstance(force_hartree_per_angstrom, float):
             raise ValueError("compute_h2_energy_quantum_statevector did not return force value.")
-        # Ha/Å → Ha/Bohr
         force_hartree_per_bohr = force_hartree_per_angstrom * BOHR_TO_ANGSTROM
         return float(energy_hartree), float(force_hartree_per_bohr)
 
-    energy_hartree, force_hartree_per_bohr = _eval_energy_force(r_bohr)
+    # --- 状態の初期化 or チェックポイントからの復元 ---
+    start_step = 0
+    if resume_from:
+        ckpt_src = os.path.join(resume_from, "checkpoint.json")
+        if not os.path.isfile(ckpt_src):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_src}")
+        with open(ckpt_src) as f:
+            ckpt = json.load(f)
+        start_step = ckpt["next_step"]
+        r_bohr = ckpt["r_bohr"]
+        v_bohr_per_au = ckpt["v_bohr_per_au"]
+        energy_hartree = ckpt["energy_hartree"]
+        force_hartree_per_bohr = ckpt["force_hartree_per_bohr"]
+        time_step_fs = ckpt["time_step_fs"]
+        logger.info(
+            "Resumed from checkpoint: step=%d, R=%.6f Bohr, E=%.12f Ha",
+            start_step, r_bohr, energy_hartree,
+        )
+        # 前回の CSV を新ディレクトリにコピーして続きを追記
+        prev_csv = os.path.join(resume_from, "dynamics_seq.csv")
+        if resume_from != out_dir and os.path.isfile(prev_csv):
+            shutil.copy2(prev_csv, out_csv)
+    else:
+        r_bohr = initial_r_angstrom * ANGSTROM_TO_BOHR
+        v_bohr_per_au = initial_v_ang_per_fs * ANGSTROM_TO_BOHR / (1.0 / T_AU_FS)
+        energy_hartree, force_hartree_per_bohr = _eval_energy_force(r_bohr)
 
-    for i in range(total_step):
-        logger.info("step %d / %d", i, total_step)
-        t_fs = i * time_step_fs
+    dt_au = time_step_fs / T_AU_FS
 
-        results.append(
-            {
+    # --- CSV を追記モードで開く ---
+    csv_exists = os.path.isfile(out_csv) and os.path.getsize(out_csv) > 0
+    csv_file = open(out_csv, "a", newline="")  # noqa: SIM115
+    writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+    if not csv_exists:
+        writer.writeheader()
+        csv_file.flush()
+
+    last_row: dict[str, float] | None = None
+
+    try:
+        for i in range(start_step, total_step):
+            logger.info("step %d / %d", i, total_step)
+            t_fs = i * time_step_fs
+
+            row = {
                 "step": float(i),
                 "t_fs": float(t_fs),
                 "R_ang": float(r_bohr * BOHR_TO_ANGSTROM),
@@ -288,41 +382,57 @@ def dynamics_seq(timestamp: str, backend: Any | None = None) -> None:
                 "E_ha": float(energy_hartree),
                 "F_ha_per_ang": float(force_hartree_per_bohr / BOHR_TO_ANGSTROM),
             }
-        )
-
-        # ガードレール: R が非物理的になったら停止
-        if r_bohr * BOHR_TO_ANGSTROM < 0.2 or r_bohr * BOHR_TO_ANGSTROM > 5.0:
-            break
-
-        a_bohr_per_au2 = force_hartree_per_bohr / MU
-        v_half = v_bohr_per_au + 0.5 * a_bohr_per_au2 * dt_au
-        r_next = r_bohr + v_half * dt_au
-
-        energy_next, force_next = _eval_energy_force(r_next)
-        a_next = force_next / MU
-        v_next = v_half + 0.5 * a_next * dt_au
-
-        r_bohr = r_next
-        v_bohr_per_au = v_next
-        energy_hartree = energy_next
-        force_hartree_per_bohr = force_next
-
-    with open(out_csv, "w", newline="") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["step", "t_fs", "R_ang", "v_ang_per_fs", "E_ha", "F_ha_per_ang"],
-        )
-        writer.writeheader()
-        for row in results:
             writer.writerow(row)
+            csv_file.flush()
+            last_row = row
+
+            # ガードレール: R が非物理的になったら停止
+            if r_bohr * BOHR_TO_ANGSTROM < 0.2 or r_bohr * BOHR_TO_ANGSTROM > 5.0:
+                logger.warning(
+                    "R=%.4f Å is outside [0.2, 5.0] Å — stopping.",
+                    r_bohr * BOHR_TO_ANGSTROM,
+                )
+                break
+
+            a_bohr_per_au2 = force_hartree_per_bohr / MU
+            v_half = v_bohr_per_au + 0.5 * a_bohr_per_au2 * dt_au
+            r_next = r_bohr + v_half * dt_au
+
+            energy_next, force_next = _eval_energy_force(r_next)
+            a_next = force_next / MU
+            v_next = v_half + 0.5 * a_next * dt_au
+
+            r_bohr = r_next
+            v_bohr_per_au = v_next
+            energy_hartree = energy_next
+            force_hartree_per_bohr = force_next
+
+            # チェックポイント: アトミック書き込み
+            ckpt_data = {
+                "next_step": i + 1,
+                "total_step": total_step,
+                "r_bohr": r_bohr,
+                "v_bohr_per_au": v_bohr_per_au,
+                "energy_hartree": energy_hartree,
+                "force_hartree_per_bohr": force_hartree_per_bohr,
+                "time_step_fs": time_step_fs,
+                "timestamp": timestamp,
+            }
+            ckpt_tmp = ckpt_path + ".tmp"
+            with open(ckpt_tmp, "w") as cf:
+                json.dump(ckpt_data, cf, indent=2)
+            os.replace(ckpt_tmp, ckpt_path)
+
+    finally:
+        csv_file.close()
 
     logger.info("Wrote: %s", out_csv)
-    if results:
-        last = results[-1]
+    if last_row:
         print(
             "Last state: "
-            f"t={last['t_fs']:.6f} fs, R={last['R_ang']:.6f} Å, "
-            f"v={last['v_ang_per_fs']:.6e} Å/fs, "
-            f"E={last['E_ha']:.12f} Ha, F={last['F_ha_per_ang']:.6e} Ha/Å"
+            f"t={last_row['t_fs']:.6f} fs, R={last_row['R_ang']:.6f} Å, "
+            f"v={last_row['v_ang_per_fs']:.6e} Å/fs, "
+            f"E={last_row['E_ha']:.12f} Ha, F={last_row['F_ha_per_ang']:.6e} Ha/Å"
         )
 
 

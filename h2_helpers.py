@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import glob
+import json
 import logging
 import os
+import platform
 import re
+import sys
 from itertools import combinations
 from typing import Any
 
@@ -47,9 +50,64 @@ __all__ = [
     "T_AU_FS",
     "compute_h2_energy_classical",
     "parse_log_files",
+    "save_run_config",
 ]
 
 logger = logging.getLogger(__name__)
+
+
+def save_run_config(
+    log_dir: str,
+    args: Any,
+    *,
+    backend_type: str = "statevector",
+    extra: dict[str, Any] | None = None,
+) -> str:
+    """Save run configuration to a JSON file for reproducibility.
+
+    Writes CLI arguments, package versions, Python version, and any
+    additional parameters to ``<log_dir>/run_config.json``.
+
+    Args:
+        log_dir: Directory where the config file is written.
+        args: ``argparse.Namespace`` (or any object with ``__dict__``).
+        backend_type: ``"statevector"`` or ``"noisy:<backend_name>"``.
+        extra: Additional key-value pairs to record (e.g. function
+            default values such as ``cholesky_tol``).
+
+    Returns:
+        Absolute path to the written config file.
+    """
+    def _version(module_name: str) -> str:
+        try:
+            mod = __import__(module_name)
+            return getattr(mod, "__version__", getattr(mod, "VERSION", "unknown"))
+        except ImportError:
+            return "not installed"
+
+    config: dict[str, Any] = {
+        "command": sys.argv,
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "packages": {
+            "qiskit": _version("qiskit"),
+            "qiskit_aer": _version("qiskit_aer"),
+            "pyscf": _version("pyscf"),
+            "numpy": _version("numpy"),
+            "scipy": _version("scipy"),
+        },
+        "backend_type": backend_type,
+        "args": vars(args) if hasattr(args, "__dict__") else dict(args),
+    }
+    if extra:
+        config["extra"] = extra
+
+    os.makedirs(log_dir, exist_ok=True)
+    config_path = os.path.join(log_dir, "run_config.json")
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2, default=str)
+    logger.info("Saved run config to %s", config_path)
+    return config_path
 
 
 def _build_sparse_pauli_hamiltonian(

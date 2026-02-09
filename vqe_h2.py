@@ -27,28 +27,14 @@ from qiskit_aer import AerSimulator
 from qiskit_ibm_runtime import QiskitRuntimeService
 from scipy.optimize import minimize
 
+from h2_helpers import (
+    _build_h2_qubit_hamiltonian,
+    save_run_config,
+)
+
 __all__: list[str] = []
 
 logger = logging.getLogger(__name__)
-
-# Hard-coded H₂ Hamiltonian at R ≈ 0.735 Å, STO-3G basis
-H2_HAMILTONIAN = SparsePauliOp(
-    [
-        "IIII", "IIIZ", "IZII", "IIZI", "ZIII",
-        "IZIZ", "IIZZ", "ZIIZ", "IZZI", "ZZII",
-        "ZIZI", "YYYY", "XXYY", "YYXX", "XXXX",
-    ],
-    coeffs=[
-        -0.09820182 + 0.0j, -0.1740751 + 0.0j, -0.1740751 + 0.0j,
-         0.2242933  + 0.0j,  0.2242933  + 0.0j,  0.16891402 + 0.0j,
-         0.1210099  + 0.0j,  0.16631441 + 0.0j,  0.16631441 + 0.0j,
-         0.1210099  + 0.0j,  0.17504456 + 0.0j,  0.04530451 + 0.0j,
-         0.04530451 + 0.0j,  0.04530451 + 0.0j,  0.04530451 + 0.0j,
-    ],
-)
-
-NUCLEAR_REPULSION = 0.7199689944489797
-TRUE_ENERGY = -1.137306
 
 
 def _cost_func(
@@ -71,9 +57,32 @@ def parse_args() -> argparse.Namespace:
     """
     parser = argparse.ArgumentParser(description="Single-shot noisy VQE for H₂")
     parser.add_argument(
+        "--distance",
+        type=float,
+        default=0.735,
+        help="H-H distance in angstroms (default: 0.735)",
+    )
+    parser.add_argument(
+        "--basis",
+        default="sto-3g",
+        help="Gaussian basis set name (default: sto-3g)",
+    )
+    parser.add_argument(
         "--backend",
         default=os.environ.get("QISKIT_BACKEND", "ibm_kawasaki"),
         help="IBM backend name (default: $QISKIT_BACKEND or ibm_kawasaki)",
+    )
+    parser.add_argument(
+        "--ansatz-reps",
+        type=int,
+        default=0,
+        help="Number of EfficientSU2 repetition layers (default: 0)",
+    )
+    parser.add_argument(
+        "--shots",
+        type=int,
+        default=1024,
+        help="Number of measurement shots (default: 1024)",
     )
     parser.add_argument(
         "--maxiter",
@@ -101,6 +110,38 @@ def main() -> None:
             logging.DEBUG if args.verbose else logging.INFO,
         )
 
+    timestamp = time.strftime("%y%m%d%H%M")
+    log_dir = f"logs/{timestamp}"
+
+    # ハミルトニアンを動的に構築
+    hamiltonian, mol, mx, _mo = _build_h2_qubit_hamiltonian(
+        distance_angstrom=args.distance,
+        basis=args.basis,
+        cholesky_tol=1e-6,
+    )
+    nuclear_repulsion = mol.energy_nuc()
+    logger.info(
+        "Hamiltonian: %d qubits, %d terms, nuclear_repulsion=%.6f",
+        hamiltonian.num_qubits, len(hamiltonian), nuclear_repulsion,
+    )
+
+    # 古典 CASCI エネルギーを参照値として計算
+    casci_energy = mx.e_tot
+    logger.info("CASCI reference energy: %.6f Ha", casci_energy)
+
+    save_run_config(
+        log_dir,
+        args,
+        backend_type=f"noisy:{args.backend}",
+        extra={
+            "cholesky_tol": 1e-6,
+            "nuclear_repulsion": nuclear_repulsion,
+            "casci_energy": casci_energy,
+            "hamiltonian_num_qubits": hamiltonian.num_qubits,
+            "hamiltonian_num_terms": len(hamiltonian),
+        },
+    )
+
     logger.info("Backend: %s, maxiter: %d", args.backend, args.maxiter)
 
     # IBM Runtime接続
@@ -110,10 +151,10 @@ def main() -> None:
 
     # アンザッツ構築
     ansatz = efficient_su2(
-        H2_HAMILTONIAN.num_qubits,
+        hamiltonian.num_qubits,
         su2_gates=["ry"],
         entanglement="linear",
-        reps=0,
+        reps=args.ansatz_reps,
     )
     x0 = 2 * np.pi * np.random.random(ansatz.num_parameters)
     logger.debug(
@@ -141,7 +182,7 @@ def main() -> None:
         ]
     )
     ansatz_isa = pm.run(ansatz)
-    hamiltonian_isa = H2_HAMILTONIAN.apply_layout(ansatz_isa.layout)
+    hamiltonian_isa = hamiltonian.apply_layout(ansatz_isa.layout)
 
     # ノイズシミュレータ構築
     backend_sim = AerSimulator.from_backend(backend)
@@ -180,7 +221,7 @@ def main() -> None:
     logger.info("Optimization finished in %.2f s", elapsed_total)
 
     # 結果表示
-    print(f"Final energy - nuclear repulsion: {result.fun - NUCLEAR_REPULSION:.6f} Ha")
+    print(f"Final energy - nuclear repulsion: {result.fun - nuclear_repulsion:.6f} Ha")
     print(result)
     print(f"Elapsed time: {elapsed_total:.2f} seconds")
 
@@ -189,14 +230,14 @@ def main() -> None:
     plt.figure(figsize=(8, 5))
     plt.plot(steps, energies, marker="o", label="VQE energy")
     plt.axhline(
-        TRUE_ENERGY,
+        casci_energy,
         color="red",
         linestyle="--",
-        label=f"True energy = {TRUE_ENERGY}",
+        label=f"CASCI energy = {casci_energy:.6f}",
     )
     plt.xlabel("Step")
     plt.ylabel("Energy (Hartree)")
-    plt.title("H₂ VQE Energy vs Step")
+    plt.title(f"H₂ VQE Energy vs Step (R={args.distance} Å, {args.basis})")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
