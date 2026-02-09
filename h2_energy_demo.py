@@ -295,7 +295,7 @@ ANG_TO_BOHR = 1.0 / BOHR_TO_ANG
 AU_TIME_TO_FS = T_AU_FS
 FS_TO_AU_TIME = 1.0 / AU_TIME_TO_FS
 
-def dynamics_seq(timestamp: str, backend_name: str = "None") -> None:
+def dynamics_seq(timestamp: str, backend: Any | None = None) -> None:
     """
     Sequential MD for H2 vibration on the 1D coordinate R (internuclear distance).
 
@@ -440,17 +440,24 @@ def main() -> None:
     print(f"Classical Full CI energy at R={R_ang:.3f} Å: {e:.12f} Ha")
     # Fetch backend once
     service = QiskitRuntimeService()
-    if args.backend_name:
-        backend = service.backend(args.backend_name)
-    else:
-        print("Fetching least busy backend...")
-        backend = service.least_busy(operational=True, simulator=False)
+    backend = service.backend("ibm_kawasaki")
     
     print(f"Using backend: {backend.name}")
 
-    # plot_force_curve_comparison(timestamp, start_ang=0.5, end_ang=3.0, step_ang=0.1, backend_name=backend.name)
-    dynamics_seq(timestamp, backend_name=backend.name)
+    # e,f = compute_h2_energy_quantum_statevector(
+    #     R_ang,
+    #     basis="sto-3g",
+    #     timestamp=timestamp,
+    #     ansatz_reps=args.ansatz_reps,
+    #     optimizer_maxiter=args.maxiter,
+    #     cholesky_tol=1e-10,
+    #     backend_arg=backend
+    # )
 
+    # print(f"Quantum VQE energy at R={R_ang:.3f} Å: {e:.12f} Ha, Force: {f:.6f} Ha/Å")
+
+    # plot_force_curve_comparison(timestamp, start_ang=0.5, end_ang=3.0, step_ang=0.1, backend_name=backend.name)
+    dynamics_seq(timestamp, backend=backend)
 
 if __name__ == "__main__":
     main()

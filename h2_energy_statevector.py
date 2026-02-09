@@ -28,6 +28,7 @@ from matplotlib import pyplot as plt
 from qiskit_nature.second_q.circuit.library import UCCSD
 from qiskit_nature.second_q.mappers import JordanWignerMapper
 from h2_helpers import _build_h2_force_operator, _build_h2_qubit_hamiltonian, _key
+from h2_energy import compute_h2_energy_classical
 
 def build_hf_reference_circuit(num_qubits: int, occ: Sequence[int]) -> QuantumCircuit:
     qc = QuantumCircuit(num_qubits)
@@ -53,6 +54,10 @@ def compute_h2_energy_quantum_statevector(
         basis=basis,
         cholesky_tol=cholesky_tol,
     )
+
+    classical_energy = compute_h2_energy_classical(distance_angstrom)
+
+    print(f"Classical HF energy at R={distance_angstrom:.2f} Å: {classical_energy:.6f} Ha")
 
     force_op = _build_h2_force_operator(mol, mo)
 

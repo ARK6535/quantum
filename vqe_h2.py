@@ -56,9 +56,8 @@ from scipy.optimize import minimize
 # Plotting functions
  
 # Random initial state and efficient_su2 ansatz
-ansatz = efficient_su2(H.num_qubits, su2_gates=["ry"], entanglement="linear", reps=4)
+ansatz = efficient_su2(H.num_qubits, su2_gates=["ry"], entanglement="linear", reps=0)
 ansatz.draw(output="mpl")
-plt.show()
 x0 = 2 * np.pi * np.random.random(ansatz.num_parameters)
 print(ansatz.decompose().depth())
 print(ansatz.num_parameters)
@@ -78,7 +77,8 @@ def cost_func(params, ansatz, H, estimator):
 from qiskit_ibm_runtime import QiskitRuntimeService
  
 service = QiskitRuntimeService()
-backend = service.least_busy(operational=True, simulator=False)
+backend_name = "ibm_kawasaki"
+backend = service.backend(backend_name)
 print("Using backend:", backend.name)
 
 from qiskit.transpiler import PassManager
@@ -91,7 +91,7 @@ from qiskit.transpiler.passes import (
 from qiskit.circuit.library import XGate
  
 target = backend.target
-pm = generate_preset_pass_manager(target=target, optimization_level=3)
+pm = generate_preset_pass_manager(target=target, optimization_level=0)
 pm.scheduling = PassManager(
     [
         ALAPScheduleAnalysis(target=target),
@@ -112,7 +112,6 @@ pm.scheduling = PassManager(
 # Use the pass manager and draw the resulting circuit
 ansatz_isa = pm.run(ansatz)
 ansatz_isa.draw(output="mpl", idle_wires=False, style="iqp")
-plt.show()
 
 hamiltonian_isa = H.apply_layout(ansatz_isa.layout)
 
