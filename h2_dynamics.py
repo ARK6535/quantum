@@ -48,18 +48,50 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _fs_to_au(t_fs: float) -> float:
+    """Convert time from femtoseconds to atomic units.
+
+    Args:
+        t_fs: Time in femtoseconds.
+
+    Returns:
+        Time in atomic units.
+    """
     return t_fs / T_AU_FS
 
 
 def _au_to_fs(t_au: float) -> float:
+    """Convert time from atomic units to femtoseconds.
+
+    Args:
+        t_au: Time in atomic units.
+
+    Returns:
+        Time in femtoseconds.
+    """
     return t_au * T_AU_FS
 
 
 def _v_angfs_to_au(v_ang_per_fs: float) -> float:
+    """Convert velocity from Å/fs to atomic units (Bohr/a.u. time).
+
+    Args:
+        v_ang_per_fs: Velocity in Ångströms per femtosecond.
+
+    Returns:
+        Velocity in atomic units.
+    """
     return v_ang_per_fs * (T_AU_FS / A0)
 
 
 def _v_au_to_angfs(v_au: float | np.ndarray) -> float | np.ndarray:
+    """Convert velocity from atomic units (Bohr/a.u. time) to Å/fs.
+
+    Args:
+        v_au: Velocity in atomic units (scalar or array).
+
+    Returns:
+        Velocity in Ångströms per femtosecond.
+    """
     return v_au * (A0 / T_AU_FS)
 
 

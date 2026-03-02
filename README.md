@@ -154,6 +154,116 @@ python read_csv.py --log-dir logs/2602091701
 - 全 CLI 引数
 - 関数デフォルト値 (cholesky_tol など、CLI に露出していないパラメータ)
 
+## 関数の呼び出しフロー
+
+各シミュレーションで実行される主要な関数の流れを示します。
+
+### 共通の量子化学パイプライン (h2_helpers.py)
+
+全てのシミュレーションで共通して呼ばれるハミルトニアン構築の流れです。与えられた原子間距離と基底関数系から、量子コンピュータ上で扱える 4-qubit のハミルトニアンを生成します。
+
+まず PySCF で水素分子の Mole オブジェクトを構築し、制限 Hartree-Fock (RHF) 計算で分子軌道を求めます。得られた分子軌道のうち結合性軌道と反結合性軌道の 2 本を活性空間として選び、CASCI(2,2) で対角化します。STO-3G 基底の場合、分子軌道が 2 本しかないため CAS(2,2) は完全 CI と一致します。
+
+活性空間の 1 電子積分と 2 電子積分を取り出した後、Jordan-Wigner 変換でフェルミオン演算子をパウリ演算子に変換します。2 電子積分については Cholesky 分解で低ランク近似し、パウリ項の数を抑えます。最終的に Qiskit の `SparsePauliOp` として 4-qubit ハミルトニアンが得られます。
+
+```
+_build_h2_qubit_hamiltonian(distance, basis)
+ ├─ _build_h2_molecule()        # PySCF の gto.Mole を構築
+ ├─ scf.RHF → kernel()          # Hartree-Fock 計算
+ ├─ mcscf.CASCI(ncas=2, nelecas=(1,1))
+ │    └─ sort_mo() → kernel()   # 活性空間 CAS(2,2) を対角化
+ ├─ get_h1eff(), get_h2eff()    # 活性空間の 1e/2e 積分を取得
+ └─ _build_sparse_pauli_hamiltonian(ecore, h1e, h2e)
+      ├─ _creators_destructors()  # Jordan-Wigner 生成・消滅演算子
+      ├─ _cholesky()               # 2e 積分の Cholesky 分解
+      └─ SparsePauliOp を組み立て  # 4-qubit ハミルトニアン
+```
+
+### 分子動力学シミュレーション (h2_energy_demo.py)
+
+H₂ の核間振動を Velocity-Verlet 法でシミュレーションします。各時間ステップで VQE を実行して、その幾何構造でのエネルギーと力を求め、原子核の位置と速度を更新します。
+
+`main()` は CLI 引数の解析と `run_config.json` の保存を行った後、`dynamics_seq()` に処理を委譲します。`dynamics_seq()` は MD ループの本体で、ステップごとに `_eval_energy_force()` を呼びます。この内部関数が `--backend-type` に応じて statevector 版か noisy 版の VQE を実行し、エネルギーと Hellmann-Feynman 力のペアを返します。
+
+statevector 版 (`compute_h2_energy_quantum_statevector`) はノイズなしの `AerSimulator(method='statevector')` を使い、UCCSD ansatz で COBYLA と L-BFGS-B の 2 段階最適化を行います。noisy 版 (`compute_h2_energy_quantum_noisy`) は IBM の実機ノイズモデルを載せた `AerSimulator.from_backend()` を使い、shots ベースの期待値評価を行います。noisy 版では `_build_pass_manager()` で動的デカップリングを含むトランスパイルも行います。
+
+CSV はステップごとに flush し、checkpoint.json はアトミック書き込みするため、途中で kill しても直前ステップまでの結果が残ります。
+
+```
+main()
+ ├─ parse_args()
+ ├─ save_run_config()                          # 実行パラメータを JSON に記録
+ ├─ energy_classical_bohr()                    # 参照用の古典エネルギー計算
+ │    └─ compute_h2_energy_classical()         # (h2_helpers) RHF → CASCI(2,2)
+ └─ dynamics_seq()                             # (h2_dynamics) Velocity-Verlet MD ループ
+      │
+      │  ┌─ [各ステップで呼ばれる] ─────────────────────────────┐
+      ├─ _eval_energy_force(r_bohr)                              │
+      │    │                                                     │
+      │    ├─ [statevector の場合]                                │
+      │    │   └─ compute_h2_energy_quantum_statevector()         │
+      │    │        ├─ _build_h2_qubit_hamiltonian()              │
+      │    │        │    ├─ _build_h2_molecule()     # PySCF Mole │
+      │    │        │    ├─ RHF → CASCI(2,2)                     │
+      │    │        │    └─ _build_sparse_pauli_hamiltonian()     │
+      │    │        │         └─ _cholesky() + Jordan-Wigner 変換 │
+      │    │        ├─ _build_h2_force_operator()    # dH/dR 演算子│
+      │    │        ├─ UCCSD ansatz + HF reference 構築           │
+      │    │        ├─ COBYLA → L-BFGS-B (2段階最適化)            │
+      │    │        │    └─ BackendEstimatorV2 (statevector)      │
+      │    │        └─ Hellmann-Feynman 力の期待値計算             │
+      │    │                                                     │
+      │    └─ [noisy の場合]                                     │
+      │        └─ compute_h2_energy_quantum_noisy()              │
+      │             ├─ (上記と同じハミルトニアン構築)              │
+      │             ├─ AerSimulator.from_backend()  # ノイズモデル│
+      │             ├─ _build_pass_manager() → トランスパイル     │
+      │             ├─ COBYLA → L-BFGS-B                         │
+      │             │    └─ BackendEstimatorV2 (noisy, shots指定) │
+      │             └─ Hellmann-Feynman 力の期待値計算             │
+      │                                                          │
+      ├─ Velocity-Verlet 積分 (r, v を更新)                      │
+      ├─ CSV に 1 行追記 + flush                                 │
+      └─ checkpoint.json をアトミック書き込み                     │
+           └─────────────────────────────────────────────────────┘
+```
+
+### VQE 単体実行 (vqe_h2.py)
+
+特定の原子間距離で 1 回だけノイズ込み VQE を実行し、エネルギーの収束過程をプロットします。IBM Quantum の実機バックエンドからノイズモデルを取得し、`AerSimulator.from_backend()` でローカルにノイズ込みシミュレーションを行います。
+
+MD 用の VQE とは異なり、ansatz は `EfficientSU2` (ハードウェア効率型) を使い、最適化は COBYLA の 1 段階のみです。ハミルトニアン構築には `h2_helpers.py` の共通パイプラインを使います。トランスパイル時に動的デカップリング (DD) を挿入し、idle 時間中のデコヒーレンスを抑制します。
+
+```
+main()
+ ├─ parse_args()
+ ├─ _build_h2_qubit_hamiltonian()              # (h2_helpers) ハミルトニアン構築
+ ├─ save_run_config()
+ ├─ QiskitRuntimeService → backend 取得
+ ├─ EfficientSU2 ansatz 構築
+ ├─ generate_preset_pass_manager() → トランスパイル (DD 付き)
+ ├─ AerSimulator.from_backend()                # ノイズモデル付きシミュレータ
+ ├─ COBYLA 最適化ループ
+ │    └─ _cost_func() → BackendEstimatorV2
+ └─ 結果プロット
+```
+
+### VQE エネルギー分布 (h2_energy_distribution.py)
+
+固定距離で VQE を繰り返し実行し、得られるエネルギーの統計分布を評価します。VQE は初期パラメータや最適化経路の違いにより毎回わずかに異なる結果を返すため、そのばらつきを定量化します。
+
+`ProcessPoolExecutor` でワーカーを並列起動し、各ワーカーが `run_batch()` 内で指定回数の VQE を逐次実行します。個々の VQE は statevector 版を使います。
+
+```
+main()
+ ├─ parse_args()
+ ├─ save_run_config()
+ └─ ProcessPoolExecutor で並列実行
+      └─ run_batch()  ×n_workers
+           └─ compute_h2_energy_quantum_statevector()  ×n_samples
+                └─ (上記 statevector フローと同じ)
+```
+
 ## ログディレクトリの構成
 
 ```
